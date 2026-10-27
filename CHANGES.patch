@@ -1,0 +1,379 @@
+diff -ruN a/com/fdossena/speedtest/core/base/Connection.java b/com/fdossena/speedtest/core/base/Connection.java
+--- a/com/fdossena/speedtest/core/base/Connection.java
++++ b/com/fdossena/speedtest/core/base/Connection.java
+@@ -14,6 +14,9 @@
+ 
+ import javax.net.SocketFactory;
+ import javax.net.ssl.SSLSocketFactory;
++import javax.net.ssl.SSLSocket;
++import javax.net.ssl.HttpsURLConnection;
++import javax.net.ssl.SSLHandshakeException;
+ 
+ public class Connection {
+     private Socket socket;
+@@ -21,8 +24,7 @@
+     private int mode=MODE_NOT_SET;
+     private static final int MODE_NOT_SET=0, MODE_HTTP=1, MODE_HTTPS=2;
+ 
+-    private static final String USER_AGENT="Speedtest-Android/1.2.3 (SDK "+Build.VERSION.SDK_INT+"; "+Build.PRODUCT+"; Android "+Build.VERSION.RELEASE+")",
+-                                LOCALE= Build.VERSION.SDK_INT>=21?Locale.getDefault().toLanguageTag():null;
++    private static final String USER_AGENT="Speedtest-Android/1.2.3 (SDK "+Build.VERSION.SDK_INT+"; "+Build.PRODUCT+"; Android "+Build.VERSION.RELEASE+")";
+ 
+     public Connection(String url, int connectTimeout, int soTimeout, int recvBuffer, int sendBuffer){
+         boolean tryHTTP=false, tryHTTPS=false;
+@@ -60,16 +62,20 @@
+         }
+         try{
+             if(mode == MODE_NOT_SET && tryHTTPS){
+-                SocketFactory factory = SSLSocketFactory.getDefault();
+-                socket=factory.createSocket();
+-                if(connectTimeout>0){
+-                    socket.connect(new InetSocketAddress(host, port==-1?443:port),connectTimeout);
+-                }else{
+-                    socket.connect(new InetSocketAddress(host, port==-1?443:port));
++                Socket transport = new Socket();
++                socket = transport;
++                transport.connect(new InetSocketAddress(host, port == -1 ? 443 : port), connectTimeout > 0 ? connectTimeout : DEFAULT_CONNECT_TIMEOUT);
++                socket = ((SSLSocketFactory) SSLSocketFactory.getDefault()).createSocket(transport, host, port == -1 ? 443 : port, true);
++                socket.setSoTimeout(soTimeout > 0 ? soTimeout : DEFAULT_SO_TIMEOUT);
++                SSLSocket tls = (SSLSocket) socket;
++                tls.startHandshake();
++                if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(host, tls.getSession())) {
++                    tls.close();
++                    throw new SSLHandshakeException("Server hostname verification failed");
+                 }
+                 mode=MODE_HTTPS;
+             }
+-        }catch(Throwable t){}
++        }catch(Throwable t){ if(socket != null) close(); }
+         try{
+             if(mode == MODE_NOT_SET && tryHTTP){
+                 SocketFactory factory = SocketFactory.getDefault();
+@@ -150,10 +156,10 @@
+             PrintStream ps=getPrintStream();
+             ps.print("GET "+path+" HTTP/1.1\r\n");
+             ps.print("Host: "+host+"\r\n");
+-            ps.print("User-Agent: "+USER_AGENT);
++            ps.print("User-Agent: "+USER_AGENT+"\r\n");
+             ps.print("Connection: "+(keepAlive?"keep-alive":"close")+"\r\n");
+             ps.print("Accept-Encoding: identity\r\n");
+-            if(LOCALE!=null) ps.print("Accept-Language: "+LOCALE+"\r\n");
++            ps.print("Accept-Language: "+Locale.getDefault().toLanguageTag()+"\r\n");
+             ps.print("\r\n");
+             ps.flush();
+         }catch (Throwable t){
+@@ -170,7 +176,7 @@
+             ps.print("User-Agent: "+USER_AGENT+"\r\n");
+             ps.print("Connection: "+(keepAlive?"keep-alive":"close")+"\r\n");
+             ps.print("Accept-Encoding: identity\r\n");
+-            if(LOCALE!=null) ps.print("Accept-Language: "+LOCALE+"\r\n");
++            ps.print("Accept-Language: "+Locale.getDefault().toLanguageTag()+"\r\n");
+             if(contentType!=null) ps.print("Content-Type: "+contentType+"\r\n");
+             ps.print("Content-Encoding: identity\r\n");
+             if(contentLength>=0) ps.print("Content-Length: "+contentLength+"\r\n");
+@@ -206,7 +212,7 @@
+                 s=readLineUnbuffered();
+                 if(s.trim().isEmpty()) break;
+                 if(s.contains(":")){
+-                    ret.put(s.substring(0,s.indexOf(":")).trim().toLowerCase(),s.substring(s.indexOf(":")+1).trim());
++                    ret.put(s.substring(0,s.indexOf(":")).trim().toLowerCase(Locale.ROOT),s.substring(s.indexOf(":")+1).trim());
+                 }
+             }
+             return ret;
+diff -ruN a/com/fdossena/speedtest/core/download/DownloadStream.java b/com/fdossena/speedtest/core/download/DownloadStream.java
+--- a/com/fdossena/speedtest/core/download/DownloadStream.java
++++ b/com/fdossena/speedtest/core/download/DownloadStream.java
+@@ -9,11 +9,12 @@
+     private String server, path;
+     private int ckSize;
+     private int connectTimeout, soTimeout, recvBuffer, sendBuffer;
+-    private Connection c=null;
+-    private Downloader downloader;
++    private volatile Connection c=null;
++    private Thread initialization;
++    private volatile Downloader downloader;
+     private String errorHandlingMode= SpeedtestConfig.ONERROR_ATTEMPT_RESTART;
+-    private long currentDownloaded=0, previouslyDownloaded=0;
+-    private boolean stopASAP=false;
++    private volatile long currentDownloaded=0, previouslyDownloaded=0;
++    private volatile boolean stopASAP=false;
+     private Logger log;
+ 
+     public DownloadStream(String server, String path, int ckSize, String errorHandlingMode, int connectTimeout, int soTimeout, int recvBuffer, int sendBuffer, Logger log){
+@@ -31,7 +32,7 @@
+ 
+     private void init(){
+         if(stopASAP) return;
+-        new Thread(){
++        initialization = new Thread(){
+             public void run(){
+                 if(c!=null){
+                     try{c.close();}catch (Throwable t){}
+@@ -73,7 +74,8 @@
+                     }else onError(t.toString());
+                 }
+             }
+-        }.start();
++        };
++        initialization.start();
+ 
+     }
+ 
+@@ -95,8 +97,10 @@
+     }
+ 
+     public void join(){
+-        while(downloader==null) Utils.sleep(0,100);
+-        try{downloader.join();}catch (Throwable t){}
++        try {
++            if (initialization != null) initialization.join();
++            if (downloader != null) downloader.join();
++        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+     }
+ 
+     private void log(String s){
+diff -ruN a/com/fdossena/speedtest/core/download/Downloader.java b/com/fdossena/speedtest/core/download/Downloader.java
+--- a/com/fdossena/speedtest/core/download/Downloader.java
++++ b/com/fdossena/speedtest/core/download/Downloader.java
+@@ -9,7 +9,7 @@
+     private Connection c;
+     private String path;
+     private int ckSize;
+-    private boolean stopASAP=false, resetASAP=false;
++    private volatile boolean stopASAP=false, resetASAP=false;
+     private long totDownloaded=0;
+ 
+     public Downloader(Connection c, String path, int ckSize){
+@@ -27,16 +27,19 @@
+             long lastProgressEvent=System.currentTimeMillis();
+             long ckBytes=ckSize*1048576, newRequestThreshold=ckBytes/4;
+             long bytesLeft=0;
++            boolean firstResponse = true;
+             InputStream in=c.getInputStream();
+             byte[] buf=new byte[BUFFER_SIZE];
+             for(;;){
+                 if(stopASAP) break;
+                 if(bytesLeft<=newRequestThreshold){
+                     c.GET(s, true);
++                    if (firstResponse) { c.parseResponseHeaders(); firstResponse = false; }
+                     bytesLeft+=ckBytes;
+                 }
+                 if(stopASAP) break;
+                 int l=in.read(buf);
++                if (l < 0) throw new java.io.EOFException("Download connection closed");
+                 if(stopASAP) break;
+                 bytesLeft-=l;
+                 if(resetASAP){
+@@ -52,12 +55,13 @@
+             c.close();
+         }catch(Throwable t){
+             try{c.close();}catch(Throwable t1){}
+-            onError(t.toString());
++            if (!stopASAP) onError(t.toString());
+         }
+     }
+ 
+     public void stopASAP(){
+         this.stopASAP=true;
++        c.close();
+     }
+ 
+     public abstract void onProgress(long downloaded);
+diff -ruN a/com/fdossena/speedtest/core/ping/PingStream.java b/com/fdossena/speedtest/core/ping/PingStream.java
+--- a/com/fdossena/speedtest/core/ping/PingStream.java
++++ b/com/fdossena/speedtest/core/ping/PingStream.java
+@@ -9,10 +9,11 @@
+     private String server, path;
+     private int remainingPings=10;
+     private int connectTimeout, soTimeout, recvBuffer, sendBuffer;
+-    private Connection c=null;
+-    private Pinger pinger;
++    private volatile Connection c=null;
++    private Thread initialization;
++    private volatile Pinger pinger;
+     private String errorHandlingMode= SpeedtestConfig.ONERROR_ATTEMPT_RESTART;
+-    private boolean stopASAP=false;
++    private volatile boolean stopASAP=false;
+     private Logger log;
+ 
+     public PingStream(String server, String path, int pings, String errorHandlingMode, int connectTimeout, int soTimeout, int recvBuffer, int sendBuffer, Logger log){
+@@ -33,7 +34,7 @@
+         if(c!=null){
+             try{c.close();}catch (Throwable t){}
+         }
+-        new Thread(){
++        initialization = new Thread(){
+             public void run(){
+                 if(pinger !=null) pinger.stopASAP();
+                 if(remainingPings<=0) return;
+@@ -75,7 +76,8 @@
+                     }else onError(t.toString());
+                 }
+             }
+-        }.start();
++        };
++        initialization.start();
+     }
+ 
+     public abstract void onError(String err);
+@@ -88,8 +90,10 @@
+     }
+ 
+     public void join(){
+-        while(pinger==null) Utils.sleep(0,100);
+-        try{pinger.join();}catch (Throwable t){}
++        try {
++            if (initialization != null) initialization.join();
++            if (pinger != null) pinger.join();
++        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+     }
+ 
+     private void log(String s){
+diff -ruN a/com/fdossena/speedtest/core/ping/Pinger.java b/com/fdossena/speedtest/core/ping/Pinger.java
+--- a/com/fdossena/speedtest/core/ping/Pinger.java
++++ b/com/fdossena/speedtest/core/ping/Pinger.java
+@@ -1,13 +1,14 @@
+ package com.fdossena.speedtest.core.ping;
+ 
+ import java.io.InputStream;
++import java.util.Locale;
+ 
+ import com.fdossena.speedtest.core.base.Connection;
+ 
+ public abstract class Pinger extends Thread{
+     private Connection c;
+     private String path;
+-    private boolean stopASAP=false;
++    private volatile boolean stopASAP=false;
+ 
+     public Pinger(Connection c, String path){
+         this.c=c;
+@@ -29,7 +30,7 @@
+                 while(true){
+                     String l=c.readLineUnbuffered();
+                     if(l==null) break;
+-                    l=l.trim().toLowerCase();
++                    l=l.trim().toLowerCase(Locale.ROOT);
+                     if(l.equals("transfer-encoding: chunked")) chunked=true;
+                     if(l.contains("200 ok")) ok=true;
+                     if(l.trim().isEmpty()){
+@@ -45,7 +46,7 @@
+             c.close();
+         }catch(Throwable t){
+             try{c.close();}catch(Throwable t1){}
+-            onError(t.toString());
++            if (!stopASAP) onError(t.toString());
+         }
+     }
+ 
+@@ -54,5 +55,6 @@
+ 
+     public void stopASAP(){
+         this.stopASAP=true;
++        c.close();
+     }
+ }
+\ No newline at end of file
+diff -ruN a/com/fdossena/speedtest/core/serverSelector/ServerSelector.java b/com/fdossena/speedtest/core/serverSelector/ServerSelector.java
+--- a/com/fdossena/speedtest/core/serverSelector/ServerSelector.java
++++ b/com/fdossena/speedtest/core/serverSelector/ServerSelector.java
+@@ -15,7 +15,7 @@
+     private static final int NOT_STARTED=0, WORKING=1, DONE=2;
+     private int timeout;
+     private static final int PINGS=3, SLOW_THRESHOLD=500;
+-    private boolean stopASAP=false;
++    private volatile boolean stopASAP=false;
+ 
+     public ServerSelector(TestPoint[] servers, int timeout){
+         addTestPoints(servers);
+diff -ruN a/com/fdossena/speedtest/core/upload/UploadStream.java b/com/fdossena/speedtest/core/upload/UploadStream.java
+--- a/com/fdossena/speedtest/core/upload/UploadStream.java
++++ b/com/fdossena/speedtest/core/upload/UploadStream.java
+@@ -9,11 +9,12 @@
+     private String server, path;
+     private int ckSize;
+     private int connectTimeout, soTimeout, recvBuffer, sendBuffer;
+-    private Connection c=null;
+-    private Uploader uploader;
++    private volatile Connection c=null;
++    private Thread initialization;
++    private volatile Uploader uploader;
+     private String errorHandlingMode= SpeedtestConfig.ONERROR_ATTEMPT_RESTART;
+-    private long currentUploaded=0, previouslyUploaded=0;
+-    private boolean stopASAP=false;
++    private volatile long currentUploaded=0, previouslyUploaded=0;
++    private volatile boolean stopASAP=false;
+     private Logger log;
+ 
+     public UploadStream(String server, String path, int ckSize, String errorHandlingMode, int connectTimeout, int soTimeout, int recvBuffer, int sendBuffer, Logger log){
+@@ -31,7 +32,7 @@
+ 
+     private void init(){
+         if(stopASAP) return;
+-        new Thread(){
++        initialization = new Thread(){
+             public void run(){
+                 if(c!=null){
+                     try{c.close();}catch (Throwable t){}
+@@ -73,7 +74,8 @@
+                     }else onError(t.toString());
+                 }
+             }
+-        }.start();
++        };
++        initialization.start();
+     }
+ 
+     public abstract void onError(String err);
+@@ -94,8 +96,10 @@
+     }
+ 
+     public void join(){
+-        while(uploader==null) Utils.sleep(0,100);
+-        try{uploader.join();}catch (Throwable t){}
++        try {
++            if (initialization != null) initialization.join();
++            if (uploader != null) uploader.join();
++        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+     }
+ 
+     private void log(String s){
+diff -ruN a/com/fdossena/speedtest/core/upload/Uploader.java b/com/fdossena/speedtest/core/upload/Uploader.java
+--- a/com/fdossena/speedtest/core/upload/Uploader.java
++++ b/com/fdossena/speedtest/core/upload/Uploader.java
+@@ -8,7 +8,7 @@
+ public abstract class Uploader extends Thread{
+     private Connection c;
+     private String path;
+-    private boolean stopASAP=false, resetASAP=false;
++    private volatile boolean stopASAP=false, resetASAP=false;
+     private long totUploaded=0;
+     private byte[] garbage;
+ 
+@@ -52,12 +52,13 @@
+             c.close();
+         }catch(Throwable t){
+             try{c.close();}catch(Throwable t1){}
+-            onError(t.toString());
++            if (!stopASAP) onError(t.toString());
+         }
+     }
+ 
+     public void stopASAP(){
+         this.stopASAP=true;
++        c.close();
+     }
+ 
+     public abstract void onProgress(long uploaded);
+diff -ruN a/com/fdossena/speedtest/core/worker/SpeedtestWorker.java b/com/fdossena/speedtest/core/worker/SpeedtestWorker.java
+--- a/com/fdossena/speedtest/core/worker/SpeedtestWorker.java
++++ b/com/fdossena/speedtest/core/worker/SpeedtestWorker.java
+@@ -20,7 +20,7 @@
+     private TestPoint backend;
+     private SpeedtestConfig config;
+     private TelemetryConfig telemetryConfig;
+-    private boolean stopASAP=false;
++    private volatile boolean stopASAP=false;
+     private double dl=-1, ul=-1, ping=-1, jitter=-1;
+     private String ipIsp="";
+     private Logger log=new Logger();
